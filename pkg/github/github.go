@@ -41,7 +41,7 @@ func (g *GithubService) ViewUserProfile(username string) (*models.Profile, error
 }
 
 func (g *GithubService) ShareCode(username, featureName, codeContent string) error {
-	branchName := fmt.Sprintf("%s-%s", username, featureName)
+	branchName := fmt.Sprintf("%s", username)
 
 	// 1. Create a new branch
 	ref, _, err := g.client.Git.GetRef(g.context, g.owner, g.repo, "refs/heads/main")
