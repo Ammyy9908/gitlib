@@ -1,8 +1,13 @@
 package github
 
 import (
+	"bytes"
 	"context"
+	"encoding/base64"
+	"encoding/json"
 	"fmt"
+	"io/ioutil"
+	"net/http"
 
 	"github.com/Ammyy9908/gitlib/pkg/models"
 
@@ -40,89 +45,164 @@ func (g *GithubService) ViewUserProfile(username string) (*models.Profile, error
 	return &models.Profile{Name: user.GetName(), Email: user.GetEmail()}, err
 }
 
-func (g *GithubService) ShareCode(username, featureName, codeContent string) error {
-	branchName := fmt.Sprintf("%s", username)
+func (g *GithubService) ShareCode(username, featureName, codeContent string, AccessToken string) error {
+	branchName := username
+	baseUrl := fmt.Sprintf("https://api.github.com/repos/%s/%s", g.owner, g.repo)
 
-	// 1. Create a new branch
-	ref, _, err := g.client.Git.GetRef(g.context, g.owner, g.repo, "refs/heads/main")
+	// 1. Get reference to main branch
+	resp, err := http.Get(fmt.Sprintf("%s/git/refs/heads/main", baseUrl))
 	if err != nil {
 		return err
 	}
+	defer resp.Body.Close()
 
-	newRef := &github.Reference{
-		Ref:    github.String("refs/heads/" + branchName),
-		Object: &github.GitObject{SHA: ref.Object.SHA},
-	}
-	_, _, err = g.client.Git.CreateRef(g.context, g.owner, g.repo, newRef)
-	if err != nil {
+	var refData map[string]interface{}
+	if err := json.NewDecoder(resp.Body).Decode(&refData); err != nil {
 		return err
 	}
 
-	// 2. Commit the code to the new branch
-	filePath := username + "/code.txt"
+	mainSHA := refData["object"].(map[string]interface{})["sha"].(string)
+
+	// 2. Create a new branch
+	branchCreationData := map[string]interface{}{
+		"ref": fmt.Sprintf("refs/heads/%s", branchName),
+		"sha": mainSHA,
+	}
+
+	jsonData, _ := json.Marshal(branchCreationData)
+	fmt.Println(string(jsonData))
+	req, _ := http.NewRequest("POST", fmt.Sprintf("%s/git/refs", baseUrl), bytes.NewBuffer(jsonData))
+	req.Header.Set("Authorization", fmt.Sprintf("Bearer %s", AccessToken)) // Assuming g.token is the authentication token
+	resp, err = http.DefaultClient.Do(req)
+	if err != nil {
+		return err
+	}
+	resp.Body.Close()
+	//print the response body
+	fmt.Println("response Status:", resp.Status)
+	fmt.Println("response Headers:", resp.Header)
+	body, _ := ioutil.ReadAll(resp.Body)
+	fmt.Println("response Body:", string(body))
+
+	// 3. Create a new blob (representing the file)
 	fileContent := []byte(codeContent)
+	blobCreationData := map[string]string{"content": base64.StdEncoding.EncodeToString(fileContent), "encoding": "base64"}
 
-	// Create a new tree with the file
-	entries := []*github.TreeEntry{
-		{
-			Path:    github.String(filePath),
-			Type:    github.String("blob"),
-			Content: github.String(string(fileContent)),
-			Mode:    github.String("100644"), // This indicates it's a file
-		},
-	}
-
-	tree, _, err := g.client.Git.CreateTree(g.context, g.owner, g.repo, *ref.Object.SHA, entries)
+	jsonData, _ = json.Marshal(blobCreationData)
+	req, _ = http.NewRequest("POST", fmt.Sprintf("%s/git/blobs", baseUrl), bytes.NewBuffer(jsonData))
+	req.Header.Set("Authorization", fmt.Sprintf("Bearer %s", AccessToken))
+	resp, err = http.DefaultClient.Do(req)
 	if err != nil {
 		return err
 	}
+	defer resp.Body.Close()
 
-	newListOptions := &github.ListOptions{
-		Page:    1,
-		PerPage: 100,
-	}
-	// Commit the tree
-	parentCommit, _, err := g.client.Repositories.GetCommit(g.context, g.owner, g.repo, *ref.Object.SHA, newListOptions)
-	if err != nil {
+	var blobData map[string]interface{}
+	if err := json.NewDecoder(resp.Body).Decode(&blobData); err != nil {
 		return err
 	}
 
-	parentCommitCore := parentCommit.GetCommit()
-	commitMessage := fmt.Sprintf("Added code by %s", username)
-	newCommit := &github.Commit{
-		Message: github.String(commitMessage),
-		Tree:    tree,
-		Parents: []*github.Commit{parentCommitCore},
+	blobSHA := blobData["sha"].(string)
+
+	// 4. Create a new tree with the blob
+	treeData := map[string][]map[string]string{
+		"tree": {{
+			"path": "filename.txt", // Your file name
+			"mode": "100644",       // Blob (file) mode
+			"type": "blob",
+			"sha":  blobSHA,
+		}},
 	}
 
-	commit, _, err := g.client.Git.CreateCommit(g.context, g.owner, g.repo, newCommit)
+	jsonData, _ = json.Marshal(treeData)
+	fmt.Println("Tree Request", string(jsonData))
+	fmt.Print("Base url", fmt.Sprintf("%s/git/trees", baseUrl))
+	req, _ = http.NewRequest("POST", fmt.Sprintf("%s/git/trees", baseUrl), bytes.NewBuffer(jsonData))
+	// ... (similar to before, get the tree SHA)
+	req.Header.Set("Authorization", fmt.Sprintf("Bearer %s", AccessToken))
+	req.Header.Set("Accept", "application/vnd.github.v3+json")
+	resp, err = http.DefaultClient.Do(req)
 	if err != nil {
 		return err
 	}
+	defer resp.Body.Close()
 
-	// Push the commit to the new branch
-	_, _, err = g.client.Git.UpdateRef(g.context, g.owner, g.repo, &github.Reference{
-		Ref:    github.String("refs/heads/" + branchName),
-		Object: &github.GitObject{SHA: commit.SHA},
-	}, false)
-	if err != nil {
+	var treeResponse map[string]interface{}
+	if err := json.NewDecoder(resp.Body).Decode(&treeResponse); err != nil {
 		return err
 	}
 
-	// 3. Create a pull request
-	prTitle := "Code shared by " + username
-	newPR := &github.NewPullRequest{
-		Title:               github.String(prTitle),
-		Head:                github.String(branchName),
-		Base:                github.String("main"),
-		Body:                github.String(fmt.Sprintf("Code shared by %s for feature %s", username, featureName)),
-		MaintainerCanModify: github.Bool(true),
+	fmt.Println("Tree response", treeResponse)
+
+	treeSHA := treeResponse["sha"].(string)
+
+	// 5. Create a new commit
+	commitData := map[string]interface{}{
+		"message": "Your commit message here",
+		"tree":    treeSHA,
+		"parents": []string{mainSHA},
+
+		// ... (other commit details, including parent SHA and tree SHA)
 	}
 
-	_, _, err = g.client.PullRequests.Create(g.context, g.owner, g.repo, newPR)
+	jsonData, _ = json.Marshal(commitData)
+	req, _ = http.NewRequest("POST", fmt.Sprintf("%s/git/commits", baseUrl), bytes.NewBuffer(jsonData))
+	// ... (similar to before, get the commit SHA)
+	req.Header.Set("Authorization", fmt.Sprintf("Bearer %s", AccessToken))
+	req.Header.Set("Accept", "application/vnd.github.v3+json")
+	resp, err = http.DefaultClient.Do(req)
 	if err != nil {
 		return err
 	}
+	defer resp.Body.Close()
+
+	var commitResponse map[string]interface{}
+
+	if err := json.NewDecoder(resp.Body).Decode(&commitResponse); err != nil {
+		return err
+	}
+	//use the request
+
+	fmt.Println("Commit response", commitResponse)
+
+	commitSha := commitResponse["sha"].(string)
+	// 6. Update the reference to point to the new commit
+	refUpdateData := map[string]string{"sha": commitSha}
+
+	jsonData, _ = json.Marshal(refUpdateData)
+	req, _ = http.NewRequest("PATCH", fmt.Sprintf("%s/git/refs/heads/%s", baseUrl, branchName), bytes.NewBuffer(jsonData))
+	req.Header.Set("Authorization", fmt.Sprintf("Bearer %s", AccessToken))
+	req.Header.Set("Accept", "application/vnd.github.v3+json")
+	resp, err = http.DefaultClient.Do(req)
+	if err != nil {
+		fmt.Println(err)
+	}
+	defer resp.Body.Close()
+
+	// 7. Create a Pull Request
+	prData := map[string]interface{}{
+		"title": "New Code Submission from " + username,
+		"body":  "Description for the PR",
+		"head":  branchName,
+		"base":  "main", // or "master" or whichever branch you're targeting
+	}
+
+	jsonData, _ = json.Marshal(prData)
+	req, _ = http.NewRequest("POST", fmt.Sprintf("%s/pulls", baseUrl), bytes.NewBuffer(jsonData))
+	req.Header.Set("Authorization", fmt.Sprintf("Bearer %s", AccessToken))
+	resp, err = http.DefaultClient.Do(req)
+	if err != nil {
+		return err
+	}
+	defer resp.Body.Close()
+
+	var prResponse map[string]interface{}
+	if err := json.NewDecoder(resp.Body).Decode(&prResponse); err != nil {
+		return err
+	}
+
+	// You can capture the PR URL or other relevant details from the response if needed.
+	fmt.Print("Pull Request Created Successfully")
 
 	return nil
 }
